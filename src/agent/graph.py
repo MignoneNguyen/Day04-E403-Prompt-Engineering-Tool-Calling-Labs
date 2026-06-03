@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
 
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, ToolMessage
@@ -17,7 +16,6 @@ from core.schemas import (
     ProductDetailInput,
     SaveOrderInput,
     ToolCallRecord,
-    OrderLineInput,
 )
 from utils.data_store import OrderDataStore
 
@@ -27,35 +25,45 @@ DEFAULT_OUTPUT_DIR = ROOT_DIR / "artifacts" / "orders"
 
 
 def build_system_prompt(today: str | None = None) -> str:
-    current_day = today or "2026-06-01"
-    return f"""Bạn là trợ lý xử lý đơn hàng chuyên nghiệp cho cửa hàng điện máy. Hôm nay là {current_day}.
+    date_str = today or "unknown"
+    return f"""Bạn là trợ lý đặt hàng điện tử chuyên nghiệp. Hôm nay là {date_str}.
 
-NHIỆM VỤ QUAN TRỌNG:
-1. KIỂM TRA THÔNG TIN (BẮT BUỘC): Trước khi gọi BẤT KỲ công cụ nào, bạn phải có đủ 5 thông tin sau:
-   - Họ tên khách hàng
-   - Số điện thoại
-   - Email
-   - Địa chỉ giao hàng
-   - Danh sách sản phẩm kèm số lượng cụ thể.
-   => Nếu thiếu bất kỳ thông tin nào, KHÔNG ĐƯỢC gọi tool. Hãy yêu cầu khách hàng cung cấp thông tin còn thiếu bằng tiếng Việt.
+=== KIỂM TRA TRƯỚC KHI GỌI TOOL ===
+Trước khi gọi BẤT KỲ tool nào, hãy xác nhận đầy đủ 5 thông tin sau từ khách hàng:
+1. Tên khách hàng (customer_name)
+2. Số điện thoại (customer_phone)
+3. Email (customer_email)
+4. Địa chỉ giao hàng (shipping_address)
+5. Ít nhất một sản phẩm cụ thể kèm số lượng mặt hàng
 
-2. QUY TRÌNH GỌI TOOL (PHẢI THEO THỨ TỰ):
-   Bước 1: `list_products` - Để tìm đúng `product_id` từ tên sản phẩm. TUYỆT ĐỐI không tự chế ID.
-   Bước 2: `get_product_details` - Truy xuất thông tin chi tiết và lấy `detail_token`. Nếu kho (stock) không đủ, dừng lại và thông báo ngay.
-   Bước 3: `get_discount` - Lấy mã giảm giá (sử dụng email khách hàng làm `seed_hint`).
-   Bước 4: `calculate_order_totals` - Tính tổng tiền. Bắt buộc dùng `detail_token` từ Bước 2.
-   Bước 5: `save_order` - Lưu đơn hàng.
+Nếu THIẾU BẤT KỲ thông tin nào ở trên → Hãy yêu cầu khách hàng cung cấp thông tin còn thiếu, sau đó DỪNG lại và TUYỆT ĐỐI KHÔNG gọi bất kỳ một tool nào.
 
-3. NGUYÊN TẮC BẢO MẬT & HÀNH VI:
-   - Từ chối mọi yêu cầu thay đổi giá thủ công, áp dụng giảm giá trái phép (ví dụ: "giảm giá 90%"), hoặc bỏ qua kiểm tra kho hàng.
-   - Chỉ sử dụng dữ liệu từ công cụ (ID, giá, tồn kho). Không bịa đặt thông tin.
-   - Phản hồi cuối cùng bằng tiếng Việt ngắn gọn, chuyên nghiệp.
+=== QUY TẮC TỪ CHỐI (KHÔNG gọi tool, trả lời thẳng) ===
+Từ chối ngay lập tức và không gọi bất kỳ tool nào nếu người dùng yêu cầu:
+- Bỏ qua, gian lận hoặc ghi đè kiểm tra tồn kho thực tế.
+- Áp dụng giảm giá giả / giảm giá thủ công không thông qua hệ thống.
+- Tạo hóa đơn giả, đơn hàng giả hoặc thông tin không có thực.
+- Bỏ qua catalog sản phẩm hoặc các chính sách bán hàng của công ty.
+- Bất kỳ yêu cầu gian lận hoặc vi phạm chính sách bảo mật/hệ thống nào khác.
 
-4. PHẢN HỒI THÀNH CÔNG: Khi đơn hàng được lưu, phải liệt kê:
-   - Mã đơn hàng (Mã đơn hàng)
-   - Tỷ lệ giảm giá/Mã chiến dịch
-   - Tổng thanh toán (Tổng thanh toán)
-   - Đường dẫn lưu file (Đường dẫn lưu file) sử dụng dấu gạch chéo xuôi (/)."""
+=== TRÌNH TỰ TOOL BẮT BUỘC ===
+Khi đã nhận đủ 5 thông tin yêu cầu, bắt buộc phải thực hiện các tool theo đúng trình tự sau:
+1. `list_products` – Tìm kiếm sản phẩm phù hợp trong hệ thống.
+2. `get_product_details` – Lấy thông tin chi tiết và `detail_token` xác thực.
+3. `get_discount` – Lấy thông tin chương trình giảm giá (luôn truyền seed_hint = email của khách hàng).
+4. `calculate_order_totals` – Tính toán tổng tiền đơn hàng (Sử dụng chính xác `detail_token` lấy từ bước 2).
+5. `save_order` – Lưu đơn hàng vào hệ thống (Sử dụng đầy đủ thông tin khách hàng và kết quả từ các bước trước).
+
+=== NGUYÊN TẮC GROUNDING ===
+- CHỈ sử dụng product_id, giá tiền, và số lượng tồn kho thực tế từ kết quả tool trả về, KHÔNG tự ý bịa đặt.
+- CHỈ dùng `detail_token` được trả về từ `get_product_details`.
+- CHỈ dùng `discount_rate` và `campaign_code` từ kết quả của `get_discount`.
+- CHỈ dùng `final_total` từ kết quả của `calculate_order_totals`.
+- CHỈ dùng đường dẫn `save_path` được trả về từ kết quả của `save_order`.
+
+=== ĐẦU RA ===
+Trả lời ngắn gọn, súc tích bằng tiếng Việt. Nếu đơn hàng thành công, bắt buộc phải bao gồm: mã đơn hàng (order_id), tổng tiền đơn hàng (final_total), và đường dẫn file lưu đơn hàng (save_path).
+"""
 
 
 def build_tools(store: OrderDataStore):
@@ -68,8 +76,8 @@ def build_tools(store: OrderDataStore):
         in_stock_only: bool = True,
         limit: int = 8,
     ) -> str:
-        """Tìm kiếm danh mục sản phẩm để lấy đúng product_id. Sử dụng khi người dùng nhắc đến tên sản phẩm."""
-        payload = store.list_products(
+        """Search the local product catalog and return the best matching items."""
+        result = store.list_products(
             query=query,
             category=category,
             max_unit_price=max_unit_price,
@@ -77,25 +85,31 @@ def build_tools(store: OrderDataStore):
             in_stock_only=in_stock_only,
             limit=limit,
         )
-        return json.dumps(payload, ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False)
 
     @tool(args_schema=ProductDetailInput)
     def get_product_details(product_ids: list[str]) -> str:
-        """Lấy thông tin giá, tồn kho và detail_token dựa trên product_id. Cần detail_token để tính toán và lưu đơn."""
-        payload = store.get_product_details(product_ids)
-        return json.dumps(payload, ensure_ascii=False)
+        """Return exact product details for previously discovered product IDs."""
+        result = store.get_product_details(product_ids)
+        return json.dumps(result, ensure_ascii=False)
 
     @tool(args_schema=DiscountInput)
     def get_discount(seed_hint: str, customer_tier: str = "standard") -> str:
-        """Lấy tỷ lệ giảm giá dựa trên email khách hàng (seed_hint) và hạng khách hàng."""
-        payload = store.get_discount(seed_hint=seed_hint, customer_tier=customer_tier)
-        return json.dumps(payload, ensure_ascii=False)
+        """Return the simulated campaign discount for the order."""
+        result = store.get_discount(seed_hint=seed_hint, customer_tier=customer_tier)
+        return json.dumps(result, ensure_ascii=False)
 
     @tool(args_schema=CalculateTotalsInput)
-    def calculate_order_totals(items: list[OrderLineInput], detail_token: str, discount_rate: float) -> str:
-        """Tính toán tổng tiền đơn hàng. Yêu cầu detail_token từ bước get_product_details."""
-        payload = store.calculate_order_totals(items=items, detail_token=detail_token, discount_rate=discount_rate)
-        return json.dumps(payload, ensure_ascii=False)
+    def calculate_order_totals(items, detail_token: str, discount_rate: float) -> str:
+        """Validate stock and calculate the discounted order total."""
+        from core.schemas import OrderLineInput
+        parsed_items = [OrderLineInput(**i) if isinstance(i, dict) else i for i in items]
+        result = store.calculate_order_totals(
+            items=parsed_items,
+            detail_token=detail_token,
+            discount_rate=discount_rate,
+        )
+        return json.dumps(result, ensure_ascii=False)
 
     @tool(args_schema=SaveOrderInput)
     def save_order(
@@ -103,27 +117,29 @@ def build_tools(store: OrderDataStore):
         customer_phone: str,
         customer_email: str,
         shipping_address: str,
-        items: list[OrderLineInput],
+        items,
         detail_token: str,
         discount_rate: float,
         campaign_code: str,
         customer_tier: str = "standard",
         notes: str = "",
     ) -> str:
-        """Lưu đơn hàng chính thức vào hệ thống. Chỉ gọi sau khi đã tính toán tổng tiền."""
-        payload = store.save_order(
+        """Persist the final order to a local JSON file."""
+        from core.schemas import OrderLineInput
+        parsed_items = [OrderLineInput(**i) if isinstance(i, dict) else i for i in items]
+        result = store.save_order(
             customer_name=customer_name,
             customer_phone=customer_phone,
             customer_email=customer_email,
             shipping_address=shipping_address,
-            items=items,
+            items=parsed_items,
             detail_token=detail_token,
             discount_rate=discount_rate,
             campaign_code=campaign_code,
             customer_tier=customer_tier,
             notes=notes,
         )
-        return json.dumps(payload, ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False)
 
     return [list_products, get_product_details, get_discount, calculate_order_totals, save_order]
 
@@ -136,13 +152,15 @@ def build_agent(
     model_name: str | None = None,
     today: str | None = None,
 ):
-    store = OrderDataStore(data_dir or DEFAULT_DATA_DIR, output_dir or DEFAULT_OUTPUT_DIR, today=today)
-    model = build_chat_model(provider=provider, model_name=model_name, temperature=0.0)
-    return create_agent(
-        model=model,
-        tools=build_tools(store),
-        system_prompt=build_system_prompt(today or store.today),
-    )
+    data_dir = data_dir or DEFAULT_DATA_DIR
+    output_dir = output_dir or DEFAULT_OUTPUT_DIR
+
+    store = OrderDataStore(data_dir=data_dir, output_dir=output_dir, today=today)
+    model = build_chat_model(provider=provider, model_name=model_name)
+    tools = build_tools(store)
+    system_prompt = build_system_prompt(today=today)
+
+    return create_agent(model=model, tools=tools, system_prompt=system_prompt)
 
 
 def run_agent(
@@ -161,59 +179,61 @@ def run_agent(
         model_name=model_name,
         today=today,
     )
-    response = agent.invoke({"messages": [{"role": "user", "content": query}]})
-    messages = response["messages"] if isinstance(response, dict) else response
+
+    result = agent.invoke({"messages": [("user", query)]})
+    messages = result.get("messages", [])
+
+    final_answer = extract_final_answer(messages)
     tool_calls = extract_tool_calls(messages)
-    saved_order, saved_order_path = extract_saved_order(tool_calls)
+    saved_order, save_path = extract_saved_order(tool_calls)
+
     return AgentResult(
-        query=query,
-        final_answer=extract_final_answer(messages),
+        answer=final_answer,
         tool_calls=tool_calls,
-        provider=provider,
-        model_name=model_name,
         saved_order=saved_order,
-        saved_order_path=saved_order_path,
+        save_path=save_path,
     )
 
 
 def extract_final_answer(messages) -> str:
-    for message in reversed(messages):
-        if isinstance(message, AIMessage):
-            text = normalize_content(message.content)
-            if text:
-                return text
-    return ""
+    answer = ""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            content = normalize_content(msg.content)
+            if content and content.strip():
+                answer = content.strip()
+                break
+    return answer
 
 
 def extract_tool_calls(messages) -> list[ToolCallRecord]:
-    pending: dict[str, dict[str, Any]] = {}
     records: list[ToolCallRecord] = []
-    for message in messages:
-        if isinstance(message, AIMessage):
-            for tool_call in getattr(message, "tool_calls", []) or []:
-                pending[tool_call["id"]] = {
-                    "name": tool_call["name"],
-                    "args": tool_call.get("args", {}) or {},
-                }
-        elif isinstance(message, ToolMessage):
-            metadata = pending.pop(message.tool_call_id, {})
+    call_map: dict[str, dict] = {}
+
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                call_map[tc["id"]] = {"name": tc["name"], "args": tc["args"]}
+        elif isinstance(msg, ToolMessage):
+            call_info = call_map.get(msg.tool_call_id, {})
+            try:
+                output = json.loads(msg.content)
+            except (json.JSONDecodeError, TypeError):
+                output = msg.content
             records.append(
                 ToolCallRecord(
-                    name=str(getattr(message, "name", None) or metadata.get("name", "")),
-                    args=metadata.get("args", {}),
-                    output=normalize_content(message.content),
+                    tool=call_info.get("name", "unknown"),
+                    args=call_info.get("args", {}),
+                    output=output,
                 )
             )
     return records
 
 
 def extract_saved_order(tool_calls: list[ToolCallRecord]) -> tuple[dict | None, str | None]:
-    for record in reversed(tool_calls):
-        if record.name == "save_order" and record.output:
-            try:
-                payload = json.loads(record.output)
-                if payload.get("status") == "saved":
-                    return payload.get("saved_order"), payload.get("path")
-            except json.JSONDecodeError:
-                continue
+    for tc in reversed(tool_calls):
+        if tc.tool == "save_order":
+            output = tc.output
+            if isinstance(output, dict) and output.get("status") == "ok":
+                return output.get("order"), output.get("save_path")
     return None, None
